@@ -8,6 +8,8 @@
 (define-constant err-invalid-rating (err u106))
 (define-constant err-already-rated (err u107))
 (define-constant err-trip-not-completed (err u108))
+(define-constant err-milestone-claimed (err u109))
+(define-constant err-milestone-not-reached (err u110))
 
 (define-constant trip-status-requested u1)
 (define-constant trip-status-accepted u2)
@@ -16,6 +18,7 @@
 
 (define-data-var platform-fee-percentage uint u5)
 (define-data-var trip-counter uint u0)
+(define-data-var reward-pool uint u0)
 
 (define-map drivers
     principal
@@ -55,6 +58,16 @@
     }
 )
 
+(define-map driver-milestones
+    principal
+    {
+        milestone-10-claimed: bool,
+        milestone-25-claimed: bool,
+        milestone-50-claimed: bool,
+        milestone-100-claimed: bool
+    }
+)
+
 (define-read-only (get-driver (driver principal))
     (map-get? drivers driver)
 )
@@ -73,6 +86,38 @@
 
 (define-read-only (get-trip-counter)
     (var-get trip-counter)
+)
+
+(define-read-only (get-reward-pool)
+    (var-get reward-pool)
+)
+
+(define-read-only (get-driver-milestones (driver principal))
+    (default-to 
+        {
+            milestone-10-claimed: false,
+            milestone-25-claimed: false,
+            milestone-50-claimed: false,
+            milestone-100-claimed: false
+        }
+        (map-get? driver-milestones driver)
+    )
+)
+
+(define-read-only (calculate-milestone-reward (trip-count uint))
+    (if (>= trip-count u100)
+        u50000000
+        (if (>= trip-count u50)
+            u20000000
+            (if (>= trip-count u25)
+                u8000000
+                (if (>= trip-count u10)
+                    u3000000
+                    u0
+                )
+            )
+        )
+    )
 )
 
 (define-read-only (calculate-platform-fee (fare uint))
@@ -116,6 +161,12 @@
             rating-sum: u0,
             rating-count: u0,
             earnings: u0
+        })
+        (map-set driver-milestones driver {
+            milestone-10-claimed: false,
+            milestone-25-claimed: false,
+            milestone-50-claimed: false,
+            milestone-100-claimed: false
         })
         (ok true)
     )
@@ -284,5 +335,67 @@
         (asserts! (<= new-fee u20) err-invalid-status)
         (var-set platform-fee-percentage new-fee)
         (ok true)
+    )
+)
+
+(define-public (fund-reward-pool (amount uint))
+    (begin
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        (var-set reward-pool (+ (var-get reward-pool) amount))
+        (ok true)
+    )
+)
+
+(define-public (claim-milestone-reward (milestone-level uint))
+    (let (
+        (driver tx-sender)
+        (driver-data (unwrap! (map-get? drivers driver) err-not-found))
+        (driver-milestone-data (get-driver-milestones driver))
+        (trip-count (get total-trips driver-data))
+    )
+        (asserts! (get registered driver-data) err-unauthorized)
+        (asserts! 
+            (or 
+                (is-eq milestone-level u10)
+                (is-eq milestone-level u25)
+                (is-eq milestone-level u50)
+                (is-eq milestone-level u100)
+            )
+            err-invalid-status
+        )
+        (asserts! (>= trip-count milestone-level) err-milestone-not-reached)
+        (asserts!
+            (if (is-eq milestone-level u10)
+                (not (get milestone-10-claimed driver-milestone-data))
+                (if (is-eq milestone-level u25)
+                    (not (get milestone-25-claimed driver-milestone-data))
+                    (if (is-eq milestone-level u50)
+                        (not (get milestone-50-claimed driver-milestone-data))
+                        (not (get milestone-100-claimed driver-milestone-data))
+                    )
+                )
+            )
+            err-milestone-claimed
+        )
+        (let (
+            (reward-amount (calculate-milestone-reward milestone-level))
+        )
+            (asserts! (>= (var-get reward-pool) reward-amount) err-insufficient-funds)
+            (try! (as-contract (stx-transfer? reward-amount tx-sender driver)))
+            (var-set reward-pool (- (var-get reward-pool) reward-amount))
+            (map-set driver-milestones driver
+                (if (is-eq milestone-level u10)
+                    (merge driver-milestone-data { milestone-10-claimed: true })
+                    (if (is-eq milestone-level u25)
+                        (merge driver-milestone-data { milestone-25-claimed: true })
+                        (if (is-eq milestone-level u50)
+                            (merge driver-milestone-data { milestone-50-claimed: true })
+                            (merge driver-milestone-data { milestone-100-claimed: true })
+                        )
+                    )
+                )
+            )
+            (ok reward-amount)
+        )
     )
 )
